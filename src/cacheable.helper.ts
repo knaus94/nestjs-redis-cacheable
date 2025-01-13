@@ -171,11 +171,11 @@ export async function cacheableHandle(
   }
 
   if (ttl) {
-    ttl = Math.ceil(ttl);
+    ttl = Math.ceil(ttl / 1000);
   }
 
   await (ttl && ttl > 0
-    ? cacheManager.store.client.set(key, serialize(value), 'EX', ttl / 1000)
+    ? cacheManager.store.client.set(key, serialize(value), 'EX', ttl)
     : cacheManager.store.client.set(key, serialize(value)));
   return value;
 }
