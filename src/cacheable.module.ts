@@ -11,7 +11,9 @@ export class CacheableModule {
     setCacheManager(this.cacheManager);
   }
   static register(defaultTTL?: number): DynamicModule {
-    setGlobalTTL(defaultTTL || 0);
+    if (defaultTTL) {
+      setGlobalTTL(defaultTTL);
+    }
 
     return {
       module: CacheableModule,

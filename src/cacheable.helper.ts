@@ -1,45 +1,42 @@
-import * as serialize from 'serialize-javascript'; // <-- ОСТАВЛЯЕМ ТОЛЬКО ДЛЯ generateComposedKey
 import { createHash } from 'crypto';
 import { CacheEvictKeyBuilder, CacheKeyBuilder } from './cacheable.interface';
-
-// ---------- 1) ПОДКЛЮЧАЕМ msgpack5 И РЕГИСТРИРУЕМ КАСТОМНЫЕ ТИПЫ ----------
-import msgpack5 from 'msgpack5';
 import { Decimal } from '@prisma/client/runtime/library';
 import { RedisCache } from 'cache-manager-ioredis-yet';
+import { createCodec, encode, decode } from 'msgpack-lite';
 
-const mp = msgpack5();
+const codec = createCodec();
 
 // Уникальные коды (type) для регистрации пользовательских типов в MessagePack
-const TYPE_DATE = 0x01;
-const TYPE_DECIMAL = 0x02;
-
-/**
- * Регистрируем тип `Date`.
- * - При кодировании превращаем Date в ISO-строку
- * - При декодировании восстанавливаем Date из строки
- */
-mp.register(
-  TYPE_DATE,
-  Date,
-  (date: Date) => Buffer.from(date.toISOString()),
-  (buf: Buffer) => new Date(buf.toString()),
-);
+const TYPE_DECIMAL = 0x07;
+const TYPE_DATE = 0x0d;
 
 /**
  * Регистрируем тип `Decimal`.
- * - При кодировании превращаем Decimal в строку
- * - При декодировании восстанавливаем Decimal из строки
+ * - При кодировании превращаем `Decimal` в строку.
+ * - При декодировании восстанавливаем обратно в `Decimal`.
  */
-mp.register(
-  TYPE_DECIMAL,
-  Decimal,
-  (decimal: Decimal) => Buffer.from(decimal.toString()),
-  (buf: Buffer) => new Decimal(buf.toString()),
-);
+codec.addExtPacker(TYPE_DECIMAL, Decimal, (decimal) => {
+  return Buffer.from(decimal.toString());
+});
+codec.addExtUnpacker(TYPE_DECIMAL, (buffer) => {
+  return new Decimal(buffer.toString());
+});
+
+/**
+ * Регистрируем тип `Date`.
+ * - При кодировании превращаем `Date` в строку.
+ * - При декодировании восстанавливаем обратно в `Date`.
+ */
+codec.addExtPacker(TYPE_DATE, Date, (date) => {
+  return Buffer.from(date.toISOString());
+});
+codec.addExtUnpacker(TYPE_DATE, (buffer) => {
+  return new Date(buffer.toString());
+});
 
 // ---------- 2) CACHE-MANAGER УПРАВЛЕНИЕ ----------
 let cacheManager: RedisCache | undefined;
-let globalTTL = 0;
+let globalTTL: number | undefined;
 export function setCacheManager(m: RedisCache) {
   cacheManager = m;
 }
@@ -53,13 +50,18 @@ export function getGlobalTTL() {
   return globalTTL;
 }
 
-// ---------- 3) (ДЕ)СЕРИАЛИЗАЦИЯ РЕЗУЛЬТАТОВ ЧЕРЕЗ msgpack5 ----------
-function serialize(data: any): Buffer {
-  return mp.encode(data).slice();
+/**
+ * Сериализация данных
+ */
+function serialize(data) {
+  return encode(data, { codec });
 }
 
-function deserialize(buf: Buffer): any {
-  return mp.decode(buf);
+/**
+ * Десериализация данных
+ */
+function deserialize(buffer: Buffer) {
+  return decode(buffer, { codec });
 }
 
 // ---------- 4) ТИПЫ ДЛЯ ГЕНЕРАЦИИ КЛЮЧЕЙ ----------
@@ -106,11 +108,7 @@ const pendingCacheMap = new Map<string, Promise<any>>();
 async function fetchCachedValue(key: string) {
   let pendingCachePromise = pendingCacheMap.get(key);
   if (!pendingCachePromise) {
-    // Берём из кэша
-    // Если реализация cache-manager/redis умеет отдавать Buffer напрямую — ок.
-    // Иначе может вернуть string, тогда придётся конвертировать,
-    // но пока считаем, что возвращается Buffer "как есть".
-    pendingCachePromise = getCacheManager().get(key);
+    pendingCachePromise = getCacheManager().store.client.getBuffer(key);
     pendingCacheMap.set(key, pendingCachePromise);
   }
   let value;
@@ -172,15 +170,8 @@ export async function cacheableHandle(
     ttl = getGlobalTTL();
   }
 
-  if (ttl > 0) {
-    await cacheManager.store.client.set(
-      key,
-      serialize(value),
-      'EX',
-      ttl / 1000,
-    );
-  } else {
-    await cacheManager.store.client.set(key, serialize(value));
-  }
+  await (ttl && ttl > 0
+    ? cacheManager.store.client.set(key, serialize(value), 'EX', ttl / 1000)
+    : cacheManager.store.client.set(key, serialize(value)));
   return value;
 }
