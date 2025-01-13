@@ -170,6 +170,10 @@ export async function cacheableHandle(
     ttl = getGlobalTTL();
   }
 
+  if (ttl) {
+    ttl = Math.ceil(ttl);
+  }
+
   await (ttl && ttl > 0
     ? cacheManager.store.client.set(key, serialize(value), 'EX', ttl / 1000)
     : cacheManager.store.client.set(key, serialize(value)));
