@@ -1,15 +1,13 @@
 import { createHash } from 'crypto';
 import stringify from 'safe-stable-stringify';
-import { CacheKeyBuilder, CacheEvictKeyBuilder } from './cacheable.interface';
+import {
+  CacheKeyBuilder,
+  CacheEvictKeyBuilder,
+  Serializer,
+} from './cacheable.interface';
 import { RedisCache } from 'cache-manager-ioredis-yet';
 
 /* ─────────────── Serializer contract ──────────────────────────── */
-
-export interface Serializer<T extends string | Buffer = string | Buffer> {
-  serialize(data: unknown): T; // value written to Redis
-  deserialize(raw: T): unknown; // raw bytes from Redis
-  storage: 'string' | 'buffer'; // choose get / getBuffer
-}
 
 /* default JSON (UTF-8 string) */
 export const jsonSerializer: Serializer<string> = {

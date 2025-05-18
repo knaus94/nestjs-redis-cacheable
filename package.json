@@ -1,6 +1,6 @@
 {
   "name": "@knaus94/nestjs-redis-cacheable",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "a simple service level cache module in NestJs",
   "author": "knaus94",
   "license": "MIT",

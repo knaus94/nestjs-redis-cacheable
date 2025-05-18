@@ -3,10 +3,10 @@ import {
   setCacheManager,
   setGlobalTTL,
   setSerializer,
-  Serializer,
 } from './cacheable.helper';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { RedisCache } from 'cache-manager-ioredis-yet';
+import { Serializer } from './cacheable.interface';
 
 export interface CacheableModuleOptions {
   defaultTTL?: number; // ms
