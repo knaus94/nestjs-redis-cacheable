@@ -1,8 +1,8 @@
-# nestjs-cacheable
+# nestjs-redis-cacheable
 
 > Service-level caching for NestJS with pluggable serializers.
 
-`@knaus94/nestjs-cacheable` extends the standard `CacheModule` so you can cache **service method** calls—not only controller responses—using two simple decorators:
+`@knaus94/nestjs-redis-cacheable` extends the standard `CacheModule` so you can cache **service method** calls—not only controller responses—using two simple decorators:
 
 | Decorator       | Purpose                                                         |
 |-----------------|-----------------------------------------------------------------|
@@ -14,8 +14,8 @@
 ## Installation
 
 ```bash
-npm i @knaus94/nestjs-cacheable          # or
-yarn add @knaus94/nestjs-cacheable
+npm i @knaus94/nestjs-redis-cacheable          # or
+yarn add @knaus94/nestjs-redis-cacheable
 ```
 
 ## Quick Start
@@ -23,7 +23,7 @@ yarn add @knaus94/nestjs-cacheable
 ```typescript
 // app.module.ts
 import { Module, CacheModule } from '@nestjs/common';
-import { CacheableModule } from '@knaus94/nestjs-cacheable';
+import { CacheableModule } from '@knaus94/nestjs-redis-cacheable';
 
 @Module({
   imports: [
@@ -86,7 +86,7 @@ export const msgPackSerializer: Serializer<Buffer> = {
 ```typescript
 // app.module.ts
 import { Module, CacheModule } from '@nestjs/common';
-import { CacheableModule } from '@knaus94/nestjs-cacheable';
+import { CacheableModule } from '@knaus94/nestjs-redis-cacheable';
 import { msgPackSerializer } from './msgpack.serializer';
 
 @Module({
