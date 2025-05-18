@@ -67,7 +67,7 @@ Below is a ready-to-use MsgPack serializer (binary, no Base64) with custom suppo
 // msgpack.serializer.ts
 import { encode, decode, createCodec } from 'msgpack-lite';
 import { Decimal } from '@prisma/client/runtime/library';
-import { Serializer } from '@knaus94/nestjs-cacheable/dist/cacheable.helper';
+import { Serializer } from '@knaus94/nestjs-redis-cacheable';
 
 const codec = createCodec();
 codec.addExtPacker(0x3f, Decimal, d => encode(d.toString()));
