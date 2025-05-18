@@ -1,19 +1,23 @@
+/* cacheable.helper.ts
+ * Service-level cache core with:
+ * 1) deterministic key hashing via safe-stable-stringify
+ * 2) watchdog timer for pendingMethodCallMap entries
+ */
+
 import { createHash } from 'crypto';
+import stringify from 'safe-stable-stringify';
 import { CacheKeyBuilder, CacheEvictKeyBuilder } from './cacheable.interface';
 import { RedisCache } from 'cache-manager-ioredis-yet';
 
 /* ─────────────── Serializer contract ──────────────────────────── */
 
 export interface Serializer<T extends string | Buffer = string | Buffer> {
-  /** value written to Redis (string or Buffer) */
-  serialize(data: unknown): T;
-  /** raw bytes read from Redis  */
-  deserialize(raw: T): unknown;
-  /** hints module which Redis API to use */
-  storage: 'string' | 'buffer';
+  serialize(data: unknown): T; // value written to Redis
+  deserialize(raw: T): unknown; // raw bytes read from Redis
+  storage: 'string' | 'buffer'; // which Redis API to use
 }
 
-/* JSON as default (stores UTF-8 string) */
+/* default JSON (UTF-8 string) */
 export const jsonSerializer: Serializer<string> = {
   storage: 'string',
   serialize: JSON.stringify,
@@ -21,19 +25,16 @@ export const jsonSerializer: Serializer<string> = {
 };
 
 let activeSerializer: Serializer = jsonSerializer;
-
 export const setSerializer = (s?: Serializer) =>
   (activeSerializer = s ?? jsonSerializer);
 export const getSerializer = () => activeSerializer;
 
 /* ─────────────── Cache-manager holder ─────────────────────────── */
 
-let cacheManager: RedisCache;
-let globalTTL: number = 0;
-
+let cacheManager!: RedisCache;
+let globalTTL = 0; // ms
 export const setCacheManager = (m: RedisCache) => (cacheManager = m);
 export const getCacheManager = () => cacheManager;
-
 export const setGlobalTTL = (ttl: number) => (globalTTL = ttl);
 export const getGlobalTTL = () => globalTTL;
 
@@ -41,10 +42,10 @@ export const getGlobalTTL = () => globalTTL;
 
 type KeyType = string | string[] | CacheKeyBuilder | CacheEvictKeyBuilder;
 
-function extract(builder: KeyType, args: unknown[]): string[] {
-  const v = builder instanceof Function ? (builder as any)(...args) : builder;
-  return Array.isArray(v) ? v : [v];
-}
+const extract = (b: KeyType, a: unknown[]) =>
+  Array.isArray(b instanceof Function ? (b as any)(...a) : b)
+    ? (b as string[])
+    : [b as any];
 
 export function generateComposedKey(opts: {
   key?: string | CacheKeyBuilder | CacheEvictKeyBuilder;
@@ -56,7 +57,7 @@ export function generateComposedKey(opts: {
     ? extract(opts.key, opts.args)
     : [
         `${opts.methodName}@${createHash('md5')
-          .update(JSON.stringify(opts.args))
+          .update(stringify(opts.args)) // deterministic & cycle-safe
           .digest('hex')}`,
       ];
 
@@ -74,8 +75,8 @@ async function fetchCachedValue(key: string) {
   let promise = pendingCacheMap.get(key);
   if (!promise) {
     promise = useBuffer
-      ? getCacheManager().store.client.getBuffer(key) // Buffer | null
-      : getCacheManager().store.client.get(key); // string | null
+      ? cacheManager.store.client.getBuffer(key) // Buffer | null
+      : cacheManager.store.client.get(key); // string  | null
     pendingCacheMap.set(key, promise);
   }
 
@@ -91,7 +92,16 @@ async function fetchCachedValue(key: string) {
 
 /* ─────────────── Cache write helpers ──────────────────────────── */
 
-const pendingMethodCallMap = new Map<string, Promise<unknown>>();
+/** entry with watchdog timer to auto-purge stale promises */
+interface PendingEntry {
+  promise: Promise<unknown>;
+  timer: NodeJS.Timeout;
+}
+
+let pendingTimeout = 30_000; // 30 s by default
+export const setPendingTimeout = (ms: number) => (pendingTimeout = ms);
+
+const pendingMethodCallMap = new Map<string, PendingEntry>();
 
 export async function cacheableHandle(
   key: string,
@@ -103,20 +113,26 @@ export async function cacheableHandle(
     const cached = await fetchCachedValue(key);
     if (cached !== undefined) return cached;
   } catch {
-    /* ignore read errors */
+    /* ignore cache read errors */
   }
 
-  /* 2. de-duplicate parallel calls */
-  let running = pendingMethodCallMap.get(key);
-  if (!running) {
-    running = method();
-    pendingMethodCallMap.set(key, running);
+  /* 2. deduplicate parallel calls with watchdog */
+  let entry = pendingMethodCallMap.get(key);
+  if (!entry) {
+    const promise = method();
+    const timer = setTimeout(
+      () => pendingMethodCallMap.delete(key), // auto-cleanup
+      pendingTimeout,
+    ).unref(); // does not keep event loop alive
+    entry = { promise, timer };
+    pendingMethodCallMap.set(key, entry);
   }
 
   let value: unknown;
   try {
-    value = await running;
+    value = await entry.promise;
   } finally {
+    clearTimeout(entry.timer);
     pendingMethodCallMap.delete(key);
   }
 
@@ -124,15 +140,15 @@ export async function cacheableHandle(
   const ttlSec =
     ttl !== undefined
       ? Math.ceil(ttl / 1000)
-      : globalTTL !== undefined
+      : globalTTL > 0
         ? Math.ceil(globalTTL / 1000)
         : 0;
 
   const data = activeSerializer.serialize(value) as any;
   if (ttlSec > 0) {
-    await getCacheManager().store.client.set(key, data, 'EX', ttlSec);
+    await cacheManager.store.client.set(key, data, 'EX', ttlSec);
   } else {
-    await getCacheManager().store.client.set(key, data);
+    await cacheManager.store.client.set(key, data);
   }
 
   return value;

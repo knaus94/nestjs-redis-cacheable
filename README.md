@@ -100,7 +100,7 @@ import { msgPackSerializer } from './msgpack.serializer';
 })
 export class AppModule {}
 ```
-# Now every cached value is stored in Redis as raw MsgPack bytes; switch back to JSON at any time by omitting the serializer option.
+Now every cached value is stored in Redis as raw MsgPack bytes; switch back to JSON at any time by omitting the serializer option.
 
 | Item                                | Description                                                                                                                     |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
