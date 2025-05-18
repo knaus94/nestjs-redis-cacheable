@@ -1,9 +1,3 @@
-/* cacheable.helper.ts
- * Service-level cache core with:
- * 1) deterministic key hashing via safe-stable-stringify
- * 2) watchdog timer for pendingMethodCallMap entries
- */
-
 import { createHash } from 'crypto';
 import stringify from 'safe-stable-stringify';
 import { CacheKeyBuilder, CacheEvictKeyBuilder } from './cacheable.interface';
@@ -13,8 +7,8 @@ import { RedisCache } from 'cache-manager-ioredis-yet';
 
 export interface Serializer<T extends string | Buffer = string | Buffer> {
   serialize(data: unknown): T; // value written to Redis
-  deserialize(raw: T): unknown; // raw bytes read from Redis
-  storage: 'string' | 'buffer'; // which Redis API to use
+  deserialize(raw: T): unknown; // raw bytes from Redis
+  storage: 'string' | 'buffer'; // choose get / getBuffer
 }
 
 /* default JSON (UTF-8 string) */
@@ -33,6 +27,7 @@ export const getSerializer = () => activeSerializer;
 
 let cacheManager!: RedisCache;
 let globalTTL = 0; // ms
+
 export const setCacheManager = (m: RedisCache) => (cacheManager = m);
 export const getCacheManager = () => cacheManager;
 export const setGlobalTTL = (ttl: number) => (globalTTL = ttl);
@@ -70,13 +65,13 @@ export function generateComposedKey(opts: {
 const pendingCacheMap = new Map<string, Promise<unknown>>();
 
 async function fetchCachedValue(key: string) {
-  const useBuffer = activeSerializer.storage === 'buffer';
+  const bufMode = activeSerializer.storage === 'buffer';
 
   let promise = pendingCacheMap.get(key);
   if (!promise) {
-    promise = useBuffer
+    promise = bufMode
       ? cacheManager.store.client.getBuffer(key) // Buffer | null
-      : cacheManager.store.client.get(key); // string  | null
+      : cacheManager.store.client.get(key); // string | null
     pendingCacheMap.set(key, promise);
   }
 
@@ -90,18 +85,42 @@ async function fetchCachedValue(key: string) {
   return raw !== null ? activeSerializer.deserialize(raw as any) : undefined;
 }
 
-/* ─────────────── Cache write helpers ──────────────────────────── */
+/* ─────────────── Pending-call map + lazy sweeper ──────────────── */
 
-/** entry with watchdog timer to auto-purge stale promises */
 interface PendingEntry {
   promise: Promise<unknown>;
-  timer: NodeJS.Timeout;
+  ts: number; // start timestamp (ms)
+}
+const pendingMethodCallMap = new Map<string, PendingEntry>();
+
+let pendingTimeout = 30_000; // drop calls older than this (ms)
+let sweepInterval = 5_000; // how often to sweep (ms)
+export const setPendingTimeout = (ms: number) => (pendingTimeout = ms);
+export const setSweepInterval = (ms: number) => (sweepInterval = ms);
+
+/* sweeper instance (starts/stops on demand) */
+let sweeper: NodeJS.Timeout | null = null;
+
+function runSweep() {
+  const now = Date.now();
+  for (const [key, ent] of pendingMethodCallMap) {
+    if (now - ent.ts > pendingTimeout) pendingMethodCallMap.delete(key);
+  }
+  if (pendingMethodCallMap.size === 0) stopSweeper(); // nothing to watch
 }
 
-let pendingTimeout = 30_000; // 30 s by default
-export const setPendingTimeout = (ms: number) => (pendingTimeout = ms);
+function startSweeper() {
+  if (!sweeper) sweeper = setInterval(runSweep, sweepInterval).unref();
+}
 
-const pendingMethodCallMap = new Map<string, PendingEntry>();
+function stopSweeper() {
+  if (sweeper) {
+    clearInterval(sweeper);
+    sweeper = null;
+  }
+}
+
+/* ─────────────── Main cache handle ────────────────────────────── */
 
 export async function cacheableHandle(
   key: string,
@@ -116,24 +135,20 @@ export async function cacheableHandle(
     /* ignore cache read errors */
   }
 
-  /* 2. deduplicate parallel calls with watchdog */
+  /* 2. deduplicate parallel calls */
   let entry = pendingMethodCallMap.get(key);
   if (!entry) {
-    const promise = method();
-    const timer = setTimeout(
-      () => pendingMethodCallMap.delete(key), // auto-cleanup
-      pendingTimeout,
-    ).unref(); // does not keep event loop alive
-    entry = { promise, timer };
+    entry = { promise: method(), ts: Date.now() };
     pendingMethodCallMap.set(key, entry);
+    startSweeper(); // enable sweeper
   }
 
   let value: unknown;
   try {
     value = await entry.promise;
   } finally {
-    clearTimeout(entry.timer);
-    pendingMethodCallMap.delete(key);
+    pendingMethodCallMap.delete(key); // normal finish
+    if (pendingMethodCallMap.size === 0) stopSweeper();
   }
 
   /* 3. write back */
@@ -144,11 +159,11 @@ export async function cacheableHandle(
         ? Math.ceil(globalTTL / 1000)
         : 0;
 
-  const data = activeSerializer.serialize(value) as any;
+  const payload = activeSerializer.serialize(value) as any;
   if (ttlSec > 0) {
-    await cacheManager.store.client.set(key, data, 'EX', ttlSec);
+    await cacheManager.store.client.set(key, payload, 'EX', ttlSec);
   } else {
-    await cacheManager.store.client.set(key, data);
+    await cacheManager.store.client.set(key, payload);
   }
 
   return value;
