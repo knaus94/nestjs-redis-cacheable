@@ -1,181 +1,139 @@
 import { createHash } from 'crypto';
-import { CacheEvictKeyBuilder, CacheKeyBuilder } from './cacheable.interface';
-import { Decimal } from '@prisma/client/runtime/library';
+import { CacheKeyBuilder, CacheEvictKeyBuilder } from './cacheable.interface';
 import { RedisCache } from 'cache-manager-ioredis-yet';
-import { createCodec, encode, decode } from 'msgpack-lite';
 
-const codec = createCodec();
+/* ─────────────── Serializer contract ──────────────────────────── */
 
-// Уникальные коды (type) для регистрации пользовательских типов в MessagePack
-const TYPE_DECIMAL = 0x3f;
-const TYPE_DATE = 0x0d;
-
-/**
- * Регистрируем тип `Decimal`.
- * - При кодировании превращаем `Decimal` в строку.
- * - При декодировании восстанавливаем обратно в `Decimal`.
- */
-codec.addExtPacker(TYPE_DECIMAL, Decimal, (decimal) => {
-  return encode(decimal.toString());
-});
-codec.addExtUnpacker(TYPE_DECIMAL, (buffer) => {
-  return new Decimal(decode(buffer));
-});
-
-/**
- * Регистрируем тип `Date`.
- * - При кодировании превращаем `Date` в строку.
- * - При декодировании восстанавливаем обратно в `Date`.
- */
-codec.addExtPacker(TYPE_DATE, Date, (date) => {
-  return encode(date.toISOString());
-});
-codec.addExtUnpacker(TYPE_DATE, (buffer) => {
-  return new Date(decode(buffer));
-});
-
-// ---------- 2) CACHE-MANAGER УПРАВЛЕНИЕ ----------
-let cacheManager: RedisCache | undefined;
-let globalTTL: number | undefined;
-export function setCacheManager(m: RedisCache) {
-  cacheManager = m;
-}
-export function getCacheManager() {
-  return cacheManager;
-}
-export function setGlobalTTL(ttl: number) {
-  globalTTL = ttl;
-}
-export function getGlobalTTL() {
-  return globalTTL;
+export interface Serializer<T extends string | Buffer = string | Buffer> {
+  /** value written to Redis (string or Buffer) */
+  serialize(data: unknown): T;
+  /** raw bytes read from Redis  */
+  deserialize(raw: T): unknown;
+  /** hints module which Redis API to use */
+  storage: 'string' | 'buffer';
 }
 
-/**
- * Сериализация данных
- */
-function serialize(data) {
-  return encode(data, { codec });
-}
+/* JSON as default (stores UTF-8 string) */
+export const jsonSerializer: Serializer<string> = {
+  storage: 'string',
+  serialize: JSON.stringify,
+  deserialize: (s) => JSON.parse(s),
+};
 
-/**
- * Десериализация данных
- */
-function deserialize(buffer: Buffer) {
-  return decode(buffer, { codec });
-}
+let activeSerializer: Serializer = jsonSerializer;
 
-// ---------- 4) ТИПЫ ДЛЯ ГЕНЕРАЦИИ КЛЮЧЕЙ ----------
+export const setSerializer = (s?: Serializer) =>
+  (activeSerializer = s ?? jsonSerializer);
+export const getSerializer = () => activeSerializer;
+
+/* ─────────────── Cache-manager holder ─────────────────────────── */
+
+let cacheManager: RedisCache;
+let globalTTL: number = 0;
+
+export const setCacheManager = (m: RedisCache) => (cacheManager = m);
+export const getCacheManager = () => cacheManager;
+
+export const setGlobalTTL = (ttl: number) => (globalTTL = ttl);
+export const getGlobalTTL = () => globalTTL;
+
+/* ─────────────── Key helpers ──────────────────────────────────── */
+
 type KeyType = string | string[] | CacheKeyBuilder | CacheEvictKeyBuilder;
 
-/**
- * try extract valid key from build function or fixed string
- */
-function extract(keyBuilder: KeyType, args: any[]): string[] {
-  const keys =
-    keyBuilder instanceof Function ? keyBuilder(...args) : keyBuilder;
-  return Array.isArray(keys) ? keys : [keys];
+function extract(builder: KeyType, args: unknown[]): string[] {
+  const v = builder instanceof Function ? (builder as any)(...args) : builder;
+  return Array.isArray(v) ? v : [v];
 }
 
-/**
- * generateComposedKey
- * generate the final cache key, compose of use key and namespace(option), like 'namespace:key'
- */
-export function generateComposedKey(options: {
+export function generateComposedKey(opts: {
   key?: string | CacheKeyBuilder | CacheEvictKeyBuilder;
   namespace?: string | CacheKeyBuilder;
   methodName: string;
-  args: any[];
+  args: unknown[];
 }): string[] {
-  let keys: string[];
-  if (options.key) {
-    keys = extract(options.key, options.args);
-  } else {
-    // Тут можно оставить serialize(...) от 'serialize-javascript',
-    // либо заменить на JSON.stringify — это не влияет на хранение результата,
-    // а только на генерацию ключа.
-    const hash = createHash('md5')
-      .update(serialize(options.args))
-      .digest('hex');
-    keys = [`${options.methodName}@${hash}`];
-  }
-  const namespace =
-    options.namespace && extract(options.namespace, options.args);
-  return keys.map((it) => (namespace ? `${namespace[0]}:${it}` : it));
+  const keys = opts.key
+    ? extract(opts.key, opts.args)
+    : [
+        `${opts.methodName}@${createHash('md5')
+          .update(JSON.stringify(opts.args))
+          .digest('hex')}`,
+      ];
+
+  const ns = opts.namespace && extract(opts.namespace, opts.args);
+  return keys.map((k) => (ns ? `${ns[0]}:${k}` : k));
 }
 
-// ---------- 5) ВОТ ВАШ pendingCacheMap ДЛЯ ЧТЕНИЯ ----------
-const pendingCacheMap = new Map<string, Promise<any>>();
+/* ─────────────── Cache read helpers ───────────────────────────── */
+
+const pendingCacheMap = new Map<string, Promise<unknown>>();
+
 async function fetchCachedValue(key: string) {
-  let pendingCachePromise = pendingCacheMap.get(key);
-  if (!pendingCachePromise) {
-    pendingCachePromise = getCacheManager().store.client.getBuffer(key);
-    pendingCacheMap.set(key, pendingCachePromise);
+  const useBuffer = activeSerializer.storage === 'buffer';
+
+  let promise = pendingCacheMap.get(key);
+  if (!promise) {
+    promise = useBuffer
+      ? getCacheManager().store.client.getBuffer(key) // Buffer | null
+      : getCacheManager().store.client.get(key); // string | null
+    pendingCacheMap.set(key, promise);
   }
-  let value;
+
+  let raw: string | Buffer | null;
   try {
-    value = await pendingCachePromise;
-  } catch (e) {
-    throw e;
+    raw = (await promise) as any;
   } finally {
     pendingCacheMap.delete(key);
   }
-  if (!value) {
-    return undefined;
-  }
 
-  // Предполагаем, что value — это Buffer, тогда десериализуем
-  return deserialize(value as Buffer);
+  return raw !== null ? activeSerializer.deserialize(raw as any) : undefined;
 }
 
-// ---------- 6) pendingMethodCallMap для предотвращения повторных запросов ----------
-const pendingMethodCallMap = new Map<string, Promise<any>>();
+/* ─────────────── Cache write helpers ──────────────────────────── */
 
-/**
- * cacheableHandle
- * 1) Сначала проверяем, есть ли в кэше
- * 2) Если нет, вызываем method()
- * 3) Сохраняем результат в кэше
- */
+const pendingMethodCallMap = new Map<string, Promise<unknown>>();
+
 export async function cacheableHandle(
   key: string,
-  method: () => Promise<any>,
+  method: () => Promise<unknown>,
   ttl?: number,
 ) {
-  // 1) Пробуем взять из кэша
+  /* 1. cache lookup */
   try {
-    const cachedValue = await fetchCachedValue(key);
-    if (cachedValue !== undefined) return cachedValue;
+    const cached = await fetchCachedValue(key);
+    if (cached !== undefined) return cached;
   } catch {
-    // игнорируем ошибки при чтении кэша
+    /* ignore read errors */
   }
 
-  // 2) Если нет, вызываем method(),
-  //    но храним промис, чтобы избежать параллельных запросов
-  let pendingMethodCallPromise = pendingMethodCallMap.get(key);
-  if (!pendingMethodCallPromise) {
-    pendingMethodCallPromise = method();
-    pendingMethodCallMap.set(key, pendingMethodCallPromise);
+  /* 2. de-duplicate parallel calls */
+  let running = pendingMethodCallMap.get(key);
+  if (!running) {
+    running = method();
+    pendingMethodCallMap.set(key, running);
   }
-  let value;
+
+  let value: unknown;
   try {
-    value = await pendingMethodCallPromise;
-  } catch (e) {
-    throw e;
+    value = await running;
   } finally {
     pendingMethodCallMap.delete(key);
   }
 
-  // 3) Сохраняем результат в кэше, используя msgpack5
-  if (ttl === undefined) {
-    ttl = getGlobalTTL();
+  /* 3. write back */
+  const ttlSec =
+    ttl !== undefined
+      ? Math.ceil(ttl / 1000)
+      : globalTTL !== undefined
+        ? Math.ceil(globalTTL / 1000)
+        : 0;
+
+  const data = activeSerializer.serialize(value) as any;
+  if (ttlSec > 0) {
+    await getCacheManager().store.client.set(key, data, 'EX', ttlSec);
+  } else {
+    await getCacheManager().store.client.set(key, data);
   }
 
-  if (ttl) {
-    ttl = Math.ceil(ttl / 1000);
-  }
-
-  await (ttl && ttl > 0
-    ? cacheManager.store.client.set(key, serialize(value), 'EX', ttl)
-    : cacheManager.store.client.set(key, serialize(value)));
   return value;
 }

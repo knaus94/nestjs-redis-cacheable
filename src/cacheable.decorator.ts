@@ -8,64 +8,61 @@ import {
   CacheEvictRegisterOptions,
 } from './cacheable.interface';
 
-export function Cacheable(options: CacheableRegisterOptions): MethodDecorator {
-  return function (target, propertyKey, descriptor) {
-    // eslint-disable-next-line @typescript-eslint/ban-types
-    const originalMethod = descriptor.value as unknown as Function;
-    return {
-      ...descriptor,
-      value: async function (...args: any[]) {
-        const cacheManager = getCacheManager();
-        if (!cacheManager) return originalMethod.apply(this, args);
-        const composeOptions: Parameters<typeof generateComposedKey>[0] = {
-          methodName: String(propertyKey),
-          key: options.key,
-          namespace: options.namespace,
-          args,
-        };
-        const cacheKey = generateComposedKey(composeOptions);
-        return cacheableHandle(
-          cacheKey[0],
-          () => originalMethod.apply(this, args),
-          options.ttl,
-        );
-      } as any,
+/* ─── @Cacheable ───────────────────────────────────────────────── */
+
+export function Cacheable(opts: CacheableRegisterOptions): MethodDecorator {
+  return (t, p, d) => {
+    const original = d.value as (...a: any[]) => Promise<unknown>;
+
+    (d as any).value = async function (...args: unknown[]) {
+      const cm = getCacheManager();
+      if (!cm) return original.apply(this, args);
+
+      const key = generateComposedKey({
+        methodName: String(p),
+        key: opts.key,
+        namespace: opts.namespace,
+        args,
+      })[0];
+
+      return cacheableHandle(key, () => original.apply(this, args), opts.ttl);
     };
+
+    return d;
   };
 }
 
+/* ─── @CacheEvict ──────────────────────────────────────────────── */
+
 export function CacheEvict(
-  ...options: CacheEvictRegisterOptions[]
+  ...opts: CacheEvictRegisterOptions[]
 ): MethodDecorator {
-  return (target, propertyKey, descriptor) => {
-    // eslint-disable-next-line @typescript-eslint/ban-types
-    const originalMethod = descriptor.value as unknown as Function;
-    return {
-      ...descriptor,
-      value: async function (...args: any[]) {
-        let value;
+  return (t, p, d) => {
+    const original = d.value as (...a: any[]) => Promise<unknown>;
+
+    (d as any).value = async function (...args: unknown[]) {
+      let result: unknown;
+      try {
+        result = await original.apply(this, args);
+      } finally {
         try {
-          value = await originalMethod.apply(this, args);
-        } catch (e) {
-          throw e;
-        } finally {
-          try {
-            await Promise.all(
-              options.map((it) => {
-                const cacheKey = generateComposedKey({
-                  ...it,
-                  methodName: propertyKey as string,
-                  args,
-                });
-                if (Array.isArray(cacheKey))
-                  return getCacheManager().store.mdel(...cacheKey);
-                return getCacheManager().del(cacheKey);
-              }),
-            );
-          } catch {}
+          await Promise.all(
+            opts.map((o) => {
+              const keys = generateComposedKey({
+                ...o,
+                methodName: String(p),
+                args,
+              });
+              return getCacheManager().store.mdel(...keys);
+            }),
+          );
+        } catch {
+          /* ignore eviction errors */
         }
-        return value;
-      } as any,
+      }
+      return result;
     };
+
+    return d;
   };
 }

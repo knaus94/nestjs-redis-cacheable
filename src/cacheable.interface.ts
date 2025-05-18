@@ -1,11 +1,12 @@
-export type CacheKeyBuilder = (...args: any[]) => string;
+export type CacheKeyBuilder = (...args: unknown[]) => string;
+export type CacheEvictKeyBuilder = (...args: unknown[]) => string | string[];
 
 export interface CacheableRegisterOptions {
   key?: string | CacheKeyBuilder;
   namespace?: string | CacheKeyBuilder;
-  ttl?: number;
+  ttl?: number; // ms
 }
-export type CacheEvictKeyBuilder = (...args: any[]) => string | string[];
+
 export interface CacheEvictRegisterOptions {
   key?: string | CacheEvictKeyBuilder;
   namespace?: string | CacheKeyBuilder;
